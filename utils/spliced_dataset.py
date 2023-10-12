@@ -1,3 +1,8 @@
+import torch
+from torch import Tensor
+
+from typing import Iterator, Iterable, Optional, Sequence, List, TypeVar, Generic, Sized, Union, Callable
+
 from enum import IntEnum
 
 class Goal(IntEnum):
@@ -5,7 +10,7 @@ class Goal(IntEnum):
     REGRESSION = 2
 
 from torch.utils.data import ConcatDataset, Subset, Dataset
-
+import re
 # TODO 参照ConcatDataset以及Subset的源代码完成重构
 class SplicedDataset(ConcatDataset):
     window_size: int
@@ -47,7 +52,7 @@ class SplicedDataset(ConcatDataset):
             match = re.search(regex, label)
             s = match.group(1)
             seg_mask.append(include_trailing_seg if s == '+' else event_mask[int(s)-1])
-        return split_by_seg(self, seg_mask)
+        return self.split_by_seg(self, seg_mask)
     
 
     def split_by_proportion(self, train_ratio=0.7, valid_ratio=0.1, shuffle=True, **kwargs): # 这个东西第三方库更好
@@ -114,7 +119,7 @@ def get_classification_datasets(data_dir, json_path, window_size, sample_rate, l
         else: 
             raise ValueError from seg["Label"]
         label_lst.append(seg["Label"])
-    return spliced_data(zip(ds_lst, label_lst))
+    return SplicedDataset(zip(ds_lst, label_lst))
 
 
 
@@ -148,30 +153,105 @@ def get_regression_datasets(data_dir, json_path, window_size, sample_rate, clamp
         else: # 暂时不支持混合发作期进来 # TODO
             pass # raise ValueError from seg["Label"]
         
-    return spliced_data(zip(ds_lst, label_lst))
+    return SplicedDataset(zip(ds_lst, label_lst))
+
 
 from torch.utils.data import RandomSampler, Sampler
-# RandomSampler已有，还需要两个
+from collections import defaultdict
 
-# TODO 参考RandomSampler的源代码造轮子
-class AugmentRandomSampler(Sampler):
-    def __init__(self, data_source, num_samples, sample_ratio, generator):
-        pass
-    def __iter__(self):
-        pass
-    def __len__(self):
-        pass
+class AugmentRandomSampler(Sampler[int]):
+    r"""Samples elements randomly from SplicedDataset instance using specified category-weights. 
 
-# TODO 参考SequentialSampler的源代码造轮子
-class SimulationSampler(Sampler):
-    def __init__(self, data_source: Sized, random_offset: bool = true) -> None:
-        self.data_source = data_source
-        pass
+    Args:
+        data_source (SplicedDataset): dataset to sample from
+        weights (sequence)   : a sequence of weights, not necessary summing up to one
+        num_samples (int): number of samples to draw, default=`len(dataset)`.
+        generator (Generator): Generator used in sampling.
+    """
+    data_source: SplicedDataset
+    weights: Tensor
+    num_samples: int
 
+    def __init__(self, data_source: SplicedDataset, weights: Sequence[float],
+                 num_samples: int, generator=None) -> None:
+        if not isinstance(data_source, SplicedDataset) or data_source.task_type != Goal.CLASSIFICATION:
+            raise ValueError("data_source should be an instance of class SplicedDataset within task_type set to Goal.CLASSIFICATION, "
+                             f"but got data_source={data_source}")
+        self.data_source = data_source 
+
+        self.generator = generator
+
+        # TODO 将weights_tensor改为类型Dict[int, double]
+        weights_tensor = torch.as_tensor(weights, dtype=torch.double)
+        if len(weights_tensor.shape) != 1:
+            raise ValueError("weights should be a 1d sequence but given "
+                             f"weights have shape {tuple(weights_tensor.shape)}")        
+        self.weights = weights_tensor
+
+        if not isinstance(num_samples, int) or num_samples <= 0:
+            raise ValueError(f"num_samples should be a positive integer value, but got num_samples={num_samples}")
+        assert(num_samples <= len(data_source)) # TODO 暂时不支持这种情况，除非已知 torch.multinomial 支持
+        self.num_samples = num_samples
+   
     def __iter__(self) -> Iterator[int]:
-        # return iter(range(len(self.data_source)))
+        sz_counter = defaultdict(int)
+        for dst in self.data_source.datasets:
+            sz_counter[dst.y] += len(dst)
+        
+        final_weights = [Tensor(size=len(dst), dtype=torch.double).fill_(self.weights[dst.y] / sz_counter[dst.y]) 
+                         for dst in self.data_source.datasets]
+        final_weights = torch.concat(final_weights)
+        rand_tensor = torch.multinomial(final_weights, self.num_samples, False, # Use False instead of removed member self.replacement, 
+                                        generator=self.generator)
+        yield from iter(rand_tensor.tolist())        
 
     def __len__(self) -> int:
-        # return len(self.data_source)
+        return self.num_samples
 
+### 写成这种Sampler未必最优，因为每个返回的int还要再调用一次ConcatDataset的__getitem__，这是对数复杂度而非常量
+### 有空可以考虑直接写成一个带参迭代器得了，替代torch.utils.DataLoader这一层抽象！
+class AugmentSequentialSampler(Sampler[int]):
+    r"""Augmented SequentialSampler with two optional features: random_offset & step_size.
+        Designed for online simulation and long-period data mining.
 
+    Args:
+        data_source (Dataset): dataset to sample from
+        random_offset (bool): whether to drop some points at every sub-seg beginning.
+        step_size(int|int (float)): integral value or function either indicating the step between two samples.
+    """    
+    # data_source: TimeSeriesSeg | SplicedDataset
+    random_offset: bool
+    step_size: Union[int, Callable[[float], int]]
+    def __init__(self, data_source: Sized, random_offset: bool = True, step_size: Union[int, Callable[[float], int]] = 0) -> None:
+        # TODO Add some checks
+        self.data_source = data_source
+
+        if not isinstance(random_offset, bool):
+            raise TypeError(f"random_offset should be a boolean value, but got random_offset={random_offset}")        
+        self.random_offset = random_offset
+
+        if isinstance(step_size, int):
+            self.step_size = step_size if step_size != 0 else data_source.window_size
+        # TODO elif isinstance(step_size, int (float)): 
+        #   self.step_size = step_size
+        else:
+            raise ValueError("step_size should be a positive integer value "
+                             "or a function receives a float argument and returns an positive integer, "
+                             f"but got step_size={step_size}")            
+
+    def __iter__(self) -> Iterator[int]:
+        window_size = self.data_source.window_size
+        cumulative_sizes: List[int] = self.data_source.cumulative_sizes if isinstance(self.data_source, ConcatDataset) \
+                                            else ConcatDataset.cumsum(self.data_source)
+        start = 0; 
+        for end in cumulative_sizes:
+            start += int(torch.randint(high=window_size, size=(1,)).item()) if self.random_offset else 0
+            while (start + window_size) < end:
+                yield start
+                # 根据step_size是整数还是函数分别计算
+                start += self.step_size if isinstance(self.step_size, int) \
+                                        else self.step_size(self.data_source[start][1]) # 以当前start对应时间窗的label值确定接下来的跨度
+            start = end
+
+    # Within step_size feature enabled, it's impossible to calculate __len__(self)
+    # def __len__(self) -> int: 
