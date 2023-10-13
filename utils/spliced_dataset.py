@@ -13,67 +13,96 @@ class Goal(IntEnum):
 from datetime import datetime
 from dataclasses import dataclass
 
+# 辅助类：禁用数据Tensor的__setitem__方法防止被意外改写
+# TODO 考虑是否要禁用 __setattr__ / __setattribute__ 方法，否则 .fill_ 之类的带下划线原地方法还是可以改写
+class ReadOnlyTensorView(Tensor):
+    def __init__(self, tensor):
+        super().__init__()
+        self.data = tensor.data
+
+    def __setitem__(self, key, value):
+        raise RuntimeError("Cannot modify a read-only tensor.")
+
 # TODO 补充 type annotations
-@dataclass
+# @dataclass
 class TimeSeriesSeg:
-    r"""
+    r"""Minimal DataClass to store an equal interval sampling ts record.
     
+    Args:
+        sample_rate: (int) 
+        raw_data: (ReadOnlyTensorView) 2-dim instance of the Base Class or its Derived Class(e.g. torch.Tensor)
+        start_dt: (datetime.datetime) Datetime at the very beginning of the record.
     """
     sample_rate: int
-    raw_data: Tensor
+    raw_data: ReadOnlyTensorView # TODO Constrained to 2-dim Tensor
     start_dt: Optional[datetime]
-    def __init__(self, sample_rate, raw_data, start_datetime=None):
+    def __init__(self, sample_rate, raw_data, start_datetime: Optional[datetime]=None):
         if not isinstance(sample_rate, int) or sample_rate <= 0:
             raise ValueError(f"sample_rate should be a positive integer value, but got sample_rate={sample_rate}")
         self.sample_rate = sample_rate
-        if not isinstance(raw_data, Tensor) or raw_data.shape != 2:
-            # TODO 加入torch.as_tensor(raw_data) & torch.Tensor(raw_data)转换尝试
-            raise TypeError(f"raw_data argument should be convertible to a 2-dim torch.Tensor, but got raw_data={raw_data}")
-        self.raw_data = raw_data
+        if not isinstance(raw_data, (Tensor, ReadOnlyTensorView)) or raw_data.squeeze_().shape != 2:
+            try: 
+                raw_data = torch.Tensor(raw_data).squeeze_()
+                if len(raw_data.shape) != 2: raise AttributeError(f"Expected 2-dim raw_data, but got {len(raw_data.shape)}-dim")
+            except Exception as exp:
+                raise TypeError(f"raw_data argument should be convertible to a 2-dim torch.Tensor, but got {len(raw_data.shape)}-dim raw_data={raw_data}") from exp
+        self.raw_data = ReadOnlyTensorView(raw_data)
         # [Optional] start_datetime 对于某些简单的任务不是必需的
-        # if not isinstance(start_datetime, datetime):
-        #     raise TypeError
+        if not isinstance(start_datetime, (datetime, None)):
+            raise TypeError(f"start_datetime should be an instance of datetime.datetime, but got start_datetime={type(start_datetime)} {start_datetime}")
         self.start_dt = start_datetime
-        # if not isinstance(task_type, Goal):
-        #     pass
-        # self.task_type = task_type
 
-# TODO 下面这两个类可以抽象出共有的部分作为基类
+import copy
 class RegressionSeg(Dataset):
-    r"""
+    r"""Map-Style subclass of torch.utils.data.Dataset for Remaining Time Estimation.
     
+    Args: 
+        sample_rate(int), X(Tensor-like), start_datetime(datetime.datetime): Used for construct self.segdata member. See :class:`TimeSeriesSeg`
+        window_size(int)
+        init_y(float): Value of the label at the very beginning of this seg.
     """
     segdata: TimeSeriesSeg
     window_size: int
     task_type: Goal = Goal.REGRESSION
-    # X: TensorView # TODO Constrained to 2-dim Tensor
-    # y: TensorView # TODO Constrained with typeof X
+    X: ReadOnlyTensorView # TODO Constrained to 2-dim Tensor
+    y: Tensor # TODO Constrained with typeof X
+    _L: int 
     def __init__(self, X, init_y, window_size, sample_rate, start_datetime=None):
         self.segdata = TimeSeriesSeg(sample_rate, X, start_datetime)
 
         if not isinstance(window_size, int) or window_size <= 0:
             raise ValueError(f"window_size should be a positive integer value, but got window_size={window_size}")
         self.window_size = window_size
-        # TODO wrap X to avoid illegal modification
-        self.X = X;
-        L = X.shape[1] - window_size + 1
-        self.y = init_y - (torch.arange(L, dtype=torch.double) / sample_rate) if L > 0 else torch.empty((0,))
+
+        self.X = self.segdata.raw_data; self._update_L()
+        self.y = init_y - (torch.arange(self._L, dtype=torch.double) / sample_rate) if self._L > 0 else None
+        # self.y = ReadOnlyTensorView(self.y) # Use @ReadOnlyTensorView
     def __len__(self):
-        return self.y.size
-    def __getitem__(self, index):
+        return self._L if self._L > 0 else 0
+    def __getitem__(self, index): # 由调用方保证不越界
         return self.X[:, index:(index+self.window_size)], self.y[index]
-    # 名字待商榷
-    def as_const_range_view(start:int = 0, end: Optional[int] = None) -> RegressionSeg:
-        pass # 利用 TensorView 类型实现
+    def _update_L(self):
+        self._L = self.X.shape[1] - self.window_size + 1
+    def range_clone(self, start:Optional[int] = 0, end: Optional[int] = None): # 由调用方保证参数类型以及start < end
+        new_dst = copy.copy(self)
+        new_dst.X = new_dst.segdata.raw_data[:, start:end]
+        new_dst._update_L()
+        new_dst.y = new_dst.y[start:(end-self.window_size) if isinstance(end, int) else None] \
+                    if new_dst._L > 0 else None
 
 class ClassificationSeg(Dataset):
-    r"""
+    r"""Map-Style subclass of torch.utils.data.Dataset for TS Classification.
     
+    Args: 
+        sample_rate(int), X(Tensor-like), start_datetime(datetime.datetime): Used for construct self.segdata member. See :class:`TimeSeriesSeg`
+        window_size(int)
+        y(int): Value of the seg label.    
     """    
     window_size: int
     task_type: Goal = Goal.CLASSIFICATION
-    # X: TensorView # TODO Constrained to 2-dim Tensor
+    X: ReadOnlyTensorView # TODO Constrained to 2-dim Tensor
     y: int
+    _L: int 
     def __init__(self, X, y, window_size, sample_rate, start_datetime=None):
         self.segdata = TimeSeriesSeg(sample_rate, X, start_datetime)
 
@@ -81,16 +110,22 @@ class ClassificationSeg(Dataset):
             raise ValueError(f"window_size should be a positive integer value, but got window_size={window_size}")
         self.window_size = window_size
 
-        # TODO wrap X to avoid illegal modification
-        self.X = X; self.y = y
+        self.X = self.segdata.raw_data; self._update_L(); self.y = y
+
     def __len__(self):
-        L = self.X.shape[1] - self.window_size + 1
-        return L if L > 0 else 0
-    def __getitem__(self, index):
+        return self._L if self._L > 0 else 0
+    
+    def __getitem__(self, index): # 由调用方保证不越界
         return self.X[:, index:(index+self.window_size)], self.y
-    # 名字待商榷
-    def as_const_range_view(start:int = 0, end: Optional[int] = None) -> RegressionSeg:
-        pass # 利用 TensorView 类型实现    
+    
+    def _update_L(self):
+        self._L = self.X.shape[1] - self.window_size + 1
+
+    def range_clone(self, start:Optional[int] = 0, end: Optional[int] = None): # 由调用方保证参数类型以及start < end
+        new_dst = copy.copy(self)
+        new_dst.X = new_dst.segdata.raw_data[:, start:end]
+        new_dst._update_L()
+        new_dst.y = new_dst.y if new_dst._L > 0 else None 
 
 #-------------------------- Core SplicedDataset ----------------------------#
 import re
@@ -169,13 +204,13 @@ class SplicedDataset(ConcatDataset):
 
         # 开始分割工作
         train_dsts = self.datasets[:t_v_dataset_idx]
-        train_dsts += [self.datasets[t_v_dataset_idx].as_const_range_view(None, t_v_sample_idx)]
+        train_dsts += [self.datasets[t_v_dataset_idx].range_clone(None, t_v_sample_idx)]
         valid_dsts = [] if train_samples == self.cumulative_sizes[v_t_dataset_idx] \
-                        else [self.datasets[t_v_dataset_idx].as_const_range_view(t_v_sample_idx, None)] 
+                        else [self.datasets[t_v_dataset_idx].range_clone(t_v_sample_idx, None)] 
         valid_dsts += self.datasets[t_v_dataset_idx+1:v_t_dataset_idx]
-        valid_dsts += [self.datasets[v_t_dataset_idx].as_const_range_view(None, v_t_sample_idx)]
+        valid_dsts += [self.datasets[v_t_dataset_idx].range_clone(None, v_t_sample_idx)]
         test_dsts = [] if (train_samples+valid_samples) == self.cumulative_sizes[v_t_dataset_idx] \
-                        else [self.datasets[v_t_dataset_idx].as_const_range_view(v_t_sample_idx, None)]
+                        else [self.datasets[v_t_dataset_idx].range_clone(v_t_sample_idx, None)]
         test_dsts += self.datasets[v_t_dataset_idx+1:]
         
         return SplicedDataset(train_dsts), SplicedDataset(valid_dsts), SplicedDataset(test_dsts)
