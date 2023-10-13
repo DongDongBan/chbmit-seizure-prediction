@@ -2,7 +2,7 @@ import torch
 from torch import Tensor
 from torch.utils.data import ConcatDataset, Subset, Dataset
 
-from typing import Iterator, Iterable, Optional, Sequence, List, TypeVar, Generic, Sized, Union, Callable
+from typing import Iterator, Optional, Sequence, List, Sized, Union, Callable, Tuple, Dict
 
 #-------------------------- Utility Data Structure ----------------------------#
 from enum import IntEnum
@@ -48,11 +48,12 @@ class TimeSeriesSeg:
                 raise TypeError(f"raw_data argument should be convertible to a 2-dim torch.Tensor, but got {len(raw_data.shape)}-dim raw_data={raw_data}") from exp
         self.raw_data = ReadOnlyTensorView(raw_data)
         # [Optional] start_datetime 对于某些简单的任务不是必需的
-        if not isinstance(start_datetime, (datetime, None)):
+        if not isinstance(start_datetime, (datetime, type(None))): # TODO Simplify type check
             raise TypeError(f"start_datetime should be an instance of datetime.datetime, but got start_datetime={type(start_datetime)} {start_datetime}")
         self.start_dt = start_datetime
 
 import copy
+# TODO 重写__getattr__方法将segdata子对象的成员暴露给Dataset对象
 class RegressionSeg(Dataset):
     r"""Map-Style subclass of torch.utils.data.Dataset for Remaining Time Estimation.
     
@@ -77,18 +78,23 @@ class RegressionSeg(Dataset):
         self.X = self.segdata.raw_data; self._update_L()
         self.y = init_y - (torch.arange(self._L, dtype=torch.double) / sample_rate) if self._L > 0 else None
         # self.y = ReadOnlyTensorView(self.y) # Use @ReadOnlyTensorView
+    
     def __len__(self):
         return self._L if self._L > 0 else 0
+    
     def __getitem__(self, index): # 由调用方保证不越界
         return self.X[:, index:(index+self.window_size)], self.y[index]
+    
     def _update_L(self):
         self._L = self.X.shape[1] - self.window_size + 1
+    
     def range_clone(self, start:Optional[int] = 0, end: Optional[int] = None): # 由调用方保证参数类型以及start < end
         new_dst = copy.copy(self)
         new_dst.X = new_dst.segdata.raw_data[:, start:end]
         new_dst._update_L()
         new_dst.y = new_dst.y[start:(end-self.window_size) if isinstance(end, int) else None] \
                     if new_dst._L > 0 else None
+        return new_dst
 
 class ClassificationSeg(Dataset):
     r"""Map-Style subclass of torch.utils.data.Dataset for TS Classification.
@@ -126,36 +132,39 @@ class ClassificationSeg(Dataset):
         new_dst.X = new_dst.segdata.raw_data[:, start:end]
         new_dst._update_L()
         new_dst.y = new_dst.y if new_dst._L > 0 else None 
+        return new_dst
 
 #-------------------------- Core SplicedDataset ----------------------------#
 import re
 import bisect
-# TODO 参照ConcatDataset以及Subset的源代码完成重构
+
+EEGSeg = Union[ClassificationSeg, RegressionSeg]
+
 class SplicedDataset(ConcatDataset):
     window_size: int
     sample_rate: int
     task_type: Goal
     # X_lst: List[TensorView] 
     # y_lst: List[Tenso|int]
-    def __init__(self, datasets: Iterable[Dataset]): # Iterable[Dataset] 可能太宽松了
-        # TODO 重写__getattr__方法将segdata子对象的成员暴露给Dataset对象
+    def __init__(self, datasets: Sequence[Dataset]): 
         def all_equal(iterable):
-            return all(x == iterable[0] for x in iterable[1:])
-        datasets = list(datasets)
-        # assert len(self.datasets) > 0, 'datasets should not be an empty iterable' # Copied from ConcatDataset.__init__()
-        if len(datasets) == 0: return None
+            lst = list(iterable)
+            return all(x == lst[0] for x in lst[1:])
+        # datasets = list(datasets)
+
+        if len(datasets) == 0: return None # ConcatDataset遇到空参数会报错，为了支持空参数这里特判一下
         if len(datasets) > 1:
             if not all_equal(map(lambda d: d.segdata.sample_rate, datasets)): # TODO d: Union[ClassificationSeg, RegressionSeg]
-                raise ValueError
+                raise ValueError("Inconsistent 'sample_rate' attributes of all datasets.")
             if not all_equal(map(lambda d: d.window_size, datasets)): # TODO d: Union[ClassificationSeg, RegressionSeg]
-                raise ValueError 
+                raise ValueError("Inconsistent 'window_size' attributes of all datasets.") 
             if not all_equal(map(lambda d: d.task_type, datasets)): # TODO d: Union[ClassificationSeg, RegressionSeg]
-                raise ValueError                               
+                raise ValueError("Inconsistent 'task_type' attributes of all datasets.")                              
         self.window_size = datasets[0].window_size
         self.sample_rate = datasets[0].segdata.sample_rate
         self.task_type = datasets[0].task_type
-        self.X_lst = list[map(lambda d: d.X.as_readonly_view(), datasets)] # TODO 将np.array 在这里原地转为 torch.const_tensorview
-        self.y_lst = [d.y for d in datasets]
+        # self.X_lst = list[map(lambda d: d.X.as_readonly_view(), datasets)]
+        # self.y_lst = [d.y for d in datasets]
         super().__init__(datasets)
 
     # TODO 慎重考虑下面三个split涉及的深浅拷贝问题
@@ -174,7 +183,8 @@ class SplicedDataset(ConcatDataset):
                 test_lst.append(ds)
         return SplicedDataset(train_lst), SplicedDataset(valid_lst), SplicedDataset(test_lst)
     
-    # 参数含义见 get_classification_datasets
+    # 参数含义见 segment_clean_dataset.ipynb 中的 'Label' 字段
+    # TODO 这个编码规则效率和简洁性还行，不过还是不太优雅
     def split_by_event(self, label_lst, event_mask, include_trailing_seg): # mask含义同split_by_seg， include_trailing_seg表示最后一次发作之后的尾随间期
         assert(len(self.datasets) == len(label_lst))
         # TODO assert(r_right < v_left && v_right < t_left)
@@ -187,28 +197,39 @@ class SplicedDataset(ConcatDataset):
         return self.split_by_seg(seg_mask)
     
 
-    def split_by_proportion(self, train_ratio=0.7, valid_ratio=0.1): # 这个东西第三方库更好
+    def split_by_proportion(self, train_ratio=0.7, valid_ratio=0.1, *args): # 这个东西第三方库更好
         # 将一个ConcatDataset按比率分割，返回三个Subset
-        total_points = sum(d.segdata.raw_data.shape[1] for d in self.datasets)
+        total_points = sum(d.X.shape[1] for d in self.datasets)
         train_samples = round(train_ratio * total_points)
         valid_samples = round(valid_ratio * total_points)
         # test_samples = total_points - train_samples - valid_samples
 
-        # 二分查找定位train-valid, valid-test分割点，不变式为
+        # 二分查找定位train-valid, valid-test分割点，不变式：
+        # 这里使用bisect_left， bisect_right的不变式类似
+        # bisect_left 返回的插入位置dataset_idx确保左侧一定严格小于，右侧大于等于
+        
+        # 左侧一定小于，保证该被一分为二的 self.datasets[dataset_idx] 的左半部分始终不能为空
+        # 等于的情况可能出现在插入后右侧，此时 self.datasets[dataset_idx] 右半部分为空，全归左
+        # 判定条件 idx == self.cumulative_sizes[dataset_idx] 
+
         t_v_dataset_idx = bisect.bisect_left(self.cumulative_sizes, train_samples)
         v_t_dataset_idx = bisect.bisect_left(self.cumulative_sizes, train_samples+valid_samples)
+
+        # 特判 dataset_idx 为 0 的情况，计算seg内偏移量 sample_idx 
         if t_v_dataset_idx == 0: t_v_sample_idx = train_samples
         else: t_v_sample_idx = train_samples - self.cumulative_sizes[t_v_dataset_idx - 1]
         if v_t_dataset_idx == 0: v_t_sample_idx = train_samples+valid_samples
         else: v_t_sample_idx = train_samples+valid_samples - self.cumulative_sizes[v_t_dataset_idx - 1]
 
-        # 开始分割工作
+        # 开始分割工作，基于前面的分析，前一部分的尾半截一定存在，后一部分的头半截不一定存在
         train_dsts = self.datasets[:t_v_dataset_idx]
-        train_dsts += [self.datasets[t_v_dataset_idx].range_clone(None, t_v_sample_idx)]
-        valid_dsts = [] if train_samples == self.cumulative_sizes[v_t_dataset_idx] \
+        train_dsts += [self.datasets[t_v_dataset_idx].range_clone(None, t_v_sample_idx)] 
+
+        valid_dsts = [] if train_samples == self.cumulative_sizes[t_v_dataset_idx] \
                         else [self.datasets[t_v_dataset_idx].range_clone(t_v_sample_idx, None)] 
         valid_dsts += self.datasets[t_v_dataset_idx+1:v_t_dataset_idx]
         valid_dsts += [self.datasets[v_t_dataset_idx].range_clone(None, v_t_sample_idx)]
+
         test_dsts = [] if (train_samples+valid_samples) == self.cumulative_sizes[v_t_dataset_idx] \
                         else [self.datasets[v_t_dataset_idx].range_clone(v_t_sample_idx, None)]
         test_dsts += self.datasets[v_t_dataset_idx+1:]
@@ -218,14 +239,17 @@ class SplicedDataset(ConcatDataset):
 #-------------------------- Auxiliary Function ----------------------------#
 # These functions are used to quickly create SplicedDataset class instances 
 # by combining JSON generated from ../segment_clean_dataset.ipynb
-class CLASSIFICATION_LABEL(IntEnum):
-    INTER = -1,
-    PRE = 0,
-    ONSET = 1
+class classification_label(IntEnum):
+    inter = -1,
+    pre = 0,
+    onset = 1
 
 import os, json
 import numpy as np
-def get_classification_datasets(data_dir, json_path, window_size, sample_rate, label = CLASSIFICATION_LABEL):
+
+# TODO 修改../segment_clean_dataset.ipynb 以支持 start_datetime 方便后期可视化
+def get_classification_datasets(data_dir, json_path, window_size, sample_rate, \
+                                label = classification_label) -> Tuple[SplicedDataset, List[str]]:
     with open(json_path) as f:
         seg_lst = json.load(f)    
     ds_lst = []; label_lst = []
@@ -234,28 +258,20 @@ def get_classification_datasets(data_dir, json_path, window_size, sample_rate, l
         X = np.load(npy_path).squeeze()
         X = X[:, slice(*seg["Span"])]        
         if 'Pre' in seg["Label"]:
-            ds_lst.append(ClassificationSeg(X, label.PRE, window_size))            
+            ds_lst.append(ClassificationSeg(X, label.pre, window_size, sample_rate))            
         elif 'Inter' in seg["Label"]: 
-            ds_lst.append(ClassificationSeg(X, label.INTER, window_size))
+            ds_lst.append(ClassificationSeg(X, label.inter, window_size, sample_rate))
         elif 'Onset' in seg["Label"]:
-            ds_lst.append(ClassificationSeg(X, label.ONSET, window_size))
+            ds_lst.append(ClassificationSeg(X, label.onset, window_size, sample_rate))
         else: 
             raise ValueError from seg["Label"]
         label_lst.append(seg["Label"])
-    return SplicedDataset(zip(ds_lst, label_lst))
+    return SplicedDataset(ds_lst), label_lst
 
-
-
-def get_regression_datasets(data_dir, json_path, window_size, sample_rate, clamp):
+def get_regression_datasets(data_dir, json_path, window_size, sample_rate) \
+                                -> Tuple[SplicedDataset, List[str]]:
     with open(json_path) as f:
         seg_lst = json.load(f)
-    
-    # if not clamp: # 本来想支持自动检测钳位值的，但是异常处理太麻烦了 # TODO
-    #     clamp = 0
-    #     for seg in seg_lst: 
-    #         if "PreSec" in seg:
-    #             clamp = max(clamp, seg["PreSec"])
-    # assert(clamp > 0)
 
     ds_lst = []; label_lst = []
     for seg in seg_lst:
@@ -263,25 +279,27 @@ def get_regression_datasets(data_dir, json_path, window_size, sample_rate, clamp
             npy_path = os.path.join(data_dir, seg["File"])
             X = np.load(npy_path).squeeze()
             X = X[:, slice(*seg["Span"])]
-            y0 = seg["PreSec"]; assert(y0 <= clamp)
+            y0 = seg["PreSec"]; 
             ds_lst.append(RegressionSeg(X, y0, window_size, sample_rate))
             label_lst.append(seg["Label"])
-        elif 'Inter' in seg["Label"]: # 默认所有inter都超过限幅clamp，不然直接用get_simulation_dataloader更方便！
+        elif 'Inter' in seg["Label"]: 
             npy_path = os.path.join(data_dir, seg["File"])
             X = np.load(npy_path).squeeze()
             X = X[:, slice(*seg["Span"])]
-            y0 = seg["PreSec"]; assert(y0 > clamp or y0 == -1) # Debug
-            ds_lst.append(ClassificationSeg(X, clamp, window_size))
+            y0 = seg["PreSec"]; # 未知下次发作的Inter区段 y0 设置成负值
+            if y0 > 0: # TODO y0 < 0 含义暂时构想为保证实际 init_y >= abs(y0)
+                ds_lst.append(RegressionSeg(X, y0, window_size, sample_rate))
             label_lst.append(seg["Label"])
-        else: # 暂时不支持混合发作期进来 # TODO
+        else: # TODO 暂时没想好估计发作期区间的标签怎么定义
             pass # raise ValueError from seg["Label"]
         
-    return SplicedDataset(zip(ds_lst, label_lst))
+    return SplicedDataset(ds_lst), label_lst
 
 #-------------------------- CustomSampler ----------------------------#
 from torch.utils.data import RandomSampler, Sampler
 from collections import defaultdict
 
+### TODO 不再定位于写 Sampler ，写一个支持多进程的 CustomDataLoader
 class AugmentRandomSampler(Sampler[int]):
     r"""Samples elements randomly from SplicedDataset instance using specified category-weights. 
 
@@ -295,7 +313,7 @@ class AugmentRandomSampler(Sampler[int]):
     weights: Tensor
     num_samples: int
 
-    def __init__(self, data_source: SplicedDataset, weights: Sequence[float],
+    def __init__(self, data_source: SplicedDataset, weights: Dict[int, float],
                  num_samples: int, generator=None) -> None:
         if not isinstance(data_source, SplicedDataset) or data_source.task_type != Goal.CLASSIFICATION:
             raise ValueError("data_source should be an instance of class SplicedDataset within task_type set to Goal.CLASSIFICATION, "
@@ -304,35 +322,44 @@ class AugmentRandomSampler(Sampler[int]):
 
         self.generator = generator
 
-        # TODO 将weights_tensor改为类型Dict[int, double]
-        weights_tensor = torch.as_tensor(weights, dtype=torch.double)
-        if len(weights_tensor.shape) != 1:
-            raise ValueError("weights should be a 1d sequence but given "
-                             f"weights have shape {tuple(weights_tensor.shape)}")        
-        self.weights = weights_tensor
+        if not isinstance(weights, dict):
+            raise TypeError("weights should be a dict mapping integral category to float weight value, "
+                             f"but got weights:{type(weights)} ={weights}")
+        for dst in self.data_source.datasets:
+            if dst.y in weights:
+                if not isinstance(weights[dst.y], (int, float)):
+                    try: weights[dst.y] = float(weights[dst.y])
+                    except: raise ValueError(f"Could not convert value to float type in pair key={dst.y}, value={weights[dst.y]}")
+                    if weights[dst.y] <= 0:
+                        raise ValueError(f"weights value must be positive, got pair key={dst.y}, value={weights[dst.y]}")
+            else: 
+                raise KeyError(f"Could not find key={dst.y} in weights.")
+        self.weights = weights
 
         if not isinstance(num_samples, int) or num_samples <= 0:
             raise ValueError(f"num_samples should be a positive integer value, but got num_samples={num_samples}")
         assert(num_samples <= len(data_source)) # TODO 暂时不支持这种情况，除非已知 torch.multinomial 支持
         self.num_samples = num_samples
    
+    # TODO RuntimeError: number of categories cannot exceed 2^24
     def __iter__(self) -> Iterator[int]:
         sz_counter = defaultdict(int)
         for dst in self.data_source.datasets:
             sz_counter[dst.y] += len(dst)
         
-        final_weights = [Tensor(size=(len(dst),), dtype=torch.double).fill_(self.weights[dst.y] / sz_counter[dst.y]) 
+        final_weights = [torch.empty(size=(len(dst),), dtype=torch.double).fill_(self.weights[dst.y] / sz_counter[dst.y]) 
                          for dst in self.data_source.datasets]
         final_weights = torch.concat(final_weights)
         rand_tensor = torch.multinomial(final_weights, self.num_samples, False, # Use False instead of removed member self.replacement, 
                                         generator=self.generator)
-        yield from iter(rand_tensor.tolist())        
+        yield from iter(rand_tensor.tolist())   
+
 
     def __len__(self) -> int:
         return self.num_samples
 
 ### 写成这种Sampler未必最优，因为每个返回的int还要再调用一次ConcatDataset的__getitem__，这是对数复杂度而非常量
-### 有空可以考虑直接写成一个带参迭代器得了，替代torch.utils.DataLoader这一层抽象！
+### TODO 有空可以考虑直接写成一个带参迭代器得了，替代torch.utils.DataLoader这一层抽象！参考 DataLoader 源代码
 class AugmentSequentialSampler(Sampler[int]):
     r"""Augmented SequentialSampler with two optional features: random_offset & step_size.
         Designed for online simulation and long-period data mining.
