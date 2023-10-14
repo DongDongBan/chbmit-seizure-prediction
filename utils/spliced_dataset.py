@@ -2,7 +2,7 @@ import torch
 from torch import Tensor
 from torch.utils.data import ConcatDataset, Subset, Dataset
 
-from typing import Iterator, Optional, Sequence, List, Sized, Union, Callable, Tuple, Dict
+from typing import Iterator, Optional, Sequence, List, Sized, Union, Iterable, Callable, Tuple, Dict
 
 #-------------------------- Utility Data Structure ----------------------------#
 from enum import IntEnum
@@ -197,7 +197,7 @@ class SplicedDataset(ConcatDataset):
         return self.split_by_seg(seg_mask)
     
 
-    def split_by_proportion(self, train_ratio=0.7, valid_ratio=0.1, *args): # 这个东西第三方库更好
+    def split_by_proportion(self, train_ratio=0.7, valid_ratio=0.1, *args, **kwargs): # 这个东西第三方库更好
         # 将一个ConcatDataset按比率分割，返回三个Subset
         total_points = sum(d.X.shape[1] for d in self.datasets)
         train_samples = round(train_ratio * total_points)
@@ -297,9 +297,8 @@ def get_regression_datasets(data_dir, json_path, window_size, sample_rate) \
 
 #-------------------------- CustomSampler ----------------------------#
 from torch.utils.data import RandomSampler, Sampler
-from collections import defaultdict
 
-### TODO 不再定位于写 Sampler ，写一个支持多进程的 CustomDataLoader
+r''' ![Deprecated] Deprecate because of our large dataset size(about 2^32) and torch.multinomial()'s limited input size
 class AugmentRandomSampler(Sampler[int]):
     r"""Samples elements randomly from SplicedDataset instance using specified category-weights. 
 
@@ -357,7 +356,8 @@ class AugmentRandomSampler(Sampler[int]):
 
     def __len__(self) -> int:
         return self.num_samples
-
+'''
+        
 ### 写成这种Sampler未必最优，因为每个返回的int还要再调用一次ConcatDataset的__getitem__，这是对数复杂度而非常量
 ### TODO 有空可以考虑直接写成一个带参迭代器得了，替代torch.utils.DataLoader这一层抽象！参考 DataLoader 源代码
 class AugmentSequentialSampler(Sampler[int]):
@@ -381,13 +381,13 @@ class AugmentSequentialSampler(Sampler[int]):
         self.random_offset = random_offset
 
         if isinstance(step_size, int):
-            self.step_size = step_size if step_size != 0 else data_source.window_size
-        # TODO elif isinstance(step_size, int (float)): 
-        #   self.step_size = step_size
+            self.step_size = step_size if step_size > 0 else data_source.window_size
+        elif isinstance(step_size, type(lambda:0)): 
+            self.step_size = step_size
         else:
             raise ValueError("step_size should be a positive integer value "
                              "or a function receives a float argument and returns an positive integer, "
-                             f"but got step_size={step_size}")            
+                             f"but got step_size={step_size}")       
 
     def __iter__(self) -> Iterator[int]:
         window_size = self.data_source.window_size
@@ -405,3 +405,53 @@ class AugmentSequentialSampler(Sampler[int]):
 
     # Within step_size feature enabled, it's impossible to calculate __len__(self)
     # def __len__(self) -> int: 
+
+from collections import defaultdict
+# TODO 阅读 DataLoader & RandomSampler & generator 源代码实现正确的继承关系以及多进程支持和类型标注
+class AugmentRandomDataLoader:
+    r"""
+    
+    """
+    def __init__(self, ds_lst: Iterable[ClassificationSeg], weights: Dict[int, float], batch_size: int = 64,
+                 generator=None, *args, **kwargs) -> None:
+        ds_lst = list(ds_lst)
+        if not all(isinstance(ds, ClassificationSeg) for ds in ds_lst):
+            raise TypeError(f"All elems in ds_lst arg should be an object of type ClassificationSeg")
+        y_2_dst: Dict[int, ConcatDataset] = self.categorize_and_concat(ds_lst)
+        
+        # torch.tensor() will do input check by the way
+        self.weights_tensor = torch.tensor([weights[k] for k in y_2_dst.keys()], dtype=torch.double)        
+        self.concat_lst = list(y_2_dst.values())
+
+        if not isinstance(batch_size, int) or batch_size <= 0:
+            raise ValueError(f"batch_size should be a positive integer value, but got batch_size={batch_size}")      
+        self.batch_size = batch_size
+
+        # TODO 加入 generator 支持
+        self.generator = generator
+        # TODO 挑选 DataLoader Hierarchy 中的合适类作基类      
+        # super().__init__(*args, **kwargs)
+
+    def __iter__(self):
+        def infinite_random_generator(cdst: ConcatDataset):
+            while True:
+                # 下面这句不知道为什么会卡死，看来迭代器和流式写法还是没学会
+                # yield from map(lambda k: cdst[k], torch.randperm(len(cdst), generator=self.generator))
+                for k in torch.randperm(len(cdst), generator=self.generator).tolist():
+                    yield cdst[k]
+        gen_lst = [infinite_random_generator(d) for d in self.concat_lst]
+        # 类别间放回抽样replacement=True，类内不放回抽样 replacement=False
+        while True: # TODO 支持 num_samples & drop_last
+            catg_lst = torch.multinomial(self.weights_tensor, self.batch_size, replacement=True,  
+                                     generator=self.generator).tolist()
+            gather_xy = [next(gen_lst[k]) for k in catg_lst]
+            yield torch.stack([xy[0] for xy in gather_xy]), torch.tensor([xy[1] for xy in gather_xy]) # List[IntEnum] 不能用作 torch.stack 参数所以使用 torch.tensor
+    
+    @staticmethod
+    def categorize_and_concat(ds_lst: Iterable[ClassificationSeg]):
+        y_2_dst = defaultdict(list)
+        for dst in ds_lst:
+            y_2_dst[dst.y].append(dst) # categorize
+        for k, v in y_2_dst.items():
+            y_2_dst[k] = ConcatDataset(y_2_dst[k]) # Concat
+        return y_2_dst
