@@ -68,7 +68,7 @@ class RegressionSeg(Dataset):
     X: ReadOnlyTensorView # TODO Constrained to 2-dim Tensor
     y: Tensor # TODO Constrained with typeof X
     _L: int 
-    def __init__(self, X, init_y, window_size, sample_rate, start_datetime=None):
+    def __init__(self, X, init_y, window_size, sample_rate, start_datetime=None, *args, **kwargs):
         self.segdata = TimeSeriesSeg(sample_rate, X, start_datetime)
 
         if not isinstance(window_size, int) or window_size <= 0:
@@ -76,9 +76,11 @@ class RegressionSeg(Dataset):
         self.window_size = window_size
 
         self.X = self.segdata.raw_data; self._update_L()
-        self.y = init_y - (torch.arange(self._L, dtype=torch.double) / sample_rate) if self._L > 0 else None
+
+        # Use the right-end side sampling vector's label as the whole window's label
+        self.y = init_y - (torch.arange(start=window_size-1, end=self.X.shape[1]-1, dtype=torch.double) / sample_rate) if self._L > 0 else None 
         # self.y = ReadOnlyTensorView(self.y) # Use @ReadOnlyTensorView
-    
+        super().__init__(*args, **kwargs)
     def __len__(self):
         return self._L if self._L > 0 else 0
     
@@ -109,7 +111,7 @@ class ClassificationSeg(Dataset):
     X: ReadOnlyTensorView # TODO Constrained to 2-dim Tensor
     y: int
     _L: int 
-    def __init__(self, X, y, window_size, sample_rate, start_datetime=None):
+    def __init__(self, X, y, window_size, sample_rate, start_datetime=None, *args, **kwargs):
         self.segdata = TimeSeriesSeg(sample_rate, X, start_datetime)
 
         if not isinstance(window_size, int) or window_size <= 0:
@@ -117,7 +119,7 @@ class ClassificationSeg(Dataset):
         self.window_size = window_size
 
         self.X = self.segdata.raw_data; self._update_L(); self.y = y
-
+        super().__init__(*args, **kwargs)
     def __len__(self):
         return self._L if self._L > 0 else 0
     
@@ -183,7 +185,7 @@ class SplicedDataset(ConcatDataset):
                 test_lst.append(ds)
         return SplicedDataset(train_lst), SplicedDataset(valid_lst), SplicedDataset(test_lst)
     
-    # 参数含义见 segment_clean_dataset.ipynb 中的 'Label' 字段
+    # 参数含义见 create_label_tgt_classification.py 中的 'Label' 字段
     # TODO 这个编码规则效率和简洁性还行，不过还是不太优雅
     def split_by_event(self, label_lst, event_mask, include_trailing_seg): # mask含义同split_by_seg， include_trailing_seg表示最后一次发作之后的尾随间期
         assert(len(self.datasets) == len(label_lst))
@@ -238,7 +240,7 @@ class SplicedDataset(ConcatDataset):
 
 #-------------------------- Auxiliary Function ----------------------------#
 # These functions are used to quickly create SplicedDataset class instances 
-# by combining JSON generated from ../segment_clean_dataset.ipynb
+# by combining JSON generated from ../create_label_tgt_classification.py
 class classification_label(IntEnum):
     inter = -1,
     pre = 0,
@@ -247,7 +249,7 @@ class classification_label(IntEnum):
 import os, json
 import numpy as np
 
-# TODO 修改../segment_clean_dataset.ipynb 以支持 start_datetime 方便后期可视化
+# TODO 修改../create_label_tgt_classification.py 以支持 start_datetime 方便后期可视化
 def get_classification_datasets(data_dir, json_path, window_size, sample_rate, \
                                 label = classification_label) -> Tuple[SplicedDataset, List[str]]:
     with open(json_path) as f:
@@ -455,3 +457,6 @@ class AugmentRandomDataLoader:
         for k, v in y_2_dst.items():
             y_2_dst[k] = ConcatDataset(y_2_dst[k]) # Concat
         return y_2_dst
+
+# TODO Impl
+# class AugmentSequentialDataLoader: 
