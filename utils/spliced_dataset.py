@@ -2,8 +2,10 @@ import torch
 from torch import Tensor
 from torch.utils.data import ConcatDataset, Subset, Dataset
 
-from typing import Iterator, Optional, Sequence, List, Sized, Union, Iterable, Callable, Tuple, Dict
-
+from typing import Any, Iterator, Optional, Sequence, List, Sized, Union, Iterable, Callable, Tuple, Dict
+# TODO 补充必要的doctest和完善不带外部数据依赖的UnitTest
+# TODO 完成所有函数的 docstring
+# TODO 小幅重构一下类型注解并尝试引入linter
 #-------------------------- Utility Data Structure ----------------------------#
 from enum import IntEnum
 class Goal(IntEnum):
@@ -11,20 +13,18 @@ class Goal(IntEnum):
     REGRESSION = 2
 
 from datetime import datetime
-from dataclasses import dataclass
+# from dataclasses import dataclass
 
 # 辅助类：禁用数据Tensor的__setitem__方法防止被意外改写
-# TODO 考虑是否要禁用 __setattr__ / __setattribute__ 方法，否则 .fill_ 之类的带下划线原地方法还是可以改写
+# TODO 封装一个完全只有 const 操作的 TensorWrapper
 class ReadOnlyTensorView(Tensor):
-    def __init__(self, tensor):
+    def __init__(self, tensor: Tensor) -> None:
         super().__init__()
         self.data = tensor.data
 
     def __setitem__(self, key, value):
         raise RuntimeError("Cannot modify a read-only tensor.")
 
-# TODO 补充 type annotations
-# @dataclass
 class TimeSeriesSeg:
     r"""Minimal DataClass to store an equal interval sampling ts record.
     
@@ -34,26 +34,29 @@ class TimeSeriesSeg:
         start_dt: (datetime.datetime) Datetime at the very beginning of the record.
     """
     sample_rate: int
-    raw_data: ReadOnlyTensorView # TODO Constrained to 2-dim Tensor
+    raw_data: ReadOnlyTensorView
     start_dt: Optional[datetime]
-    def __init__(self, sample_rate, raw_data, start_datetime: Optional[datetime]=None):
+    def __init__(self, sample_rate: int, raw_data: Union[Tensor, ReadOnlyTensorView], start_datetime: Optional[datetime]=None) -> None:
         if not isinstance(sample_rate, int) or sample_rate <= 0:
             raise ValueError(f"sample_rate should be a positive integer value, but got sample_rate={sample_rate}")
         self.sample_rate = sample_rate
-        if not isinstance(raw_data, (Tensor, ReadOnlyTensorView)) or raw_data.squeeze_().shape != 2:
+        if not isinstance(raw_data, (Tensor, ReadOnlyTensorView)) or len(raw_data.squeeze_().shape) != 2:
             try: 
                 raw_data = torch.Tensor(raw_data).squeeze_()
                 if len(raw_data.shape) != 2: raise AttributeError(f"Expected 2-dim raw_data, but got {len(raw_data.shape)}-dim")
             except Exception as exp:
-                raise TypeError(f"raw_data argument should be convertible to a 2-dim torch.Tensor, but got {len(raw_data.shape)}-dim raw_data={raw_data}") from exp
+                raise TypeError("raw_data argument should be convertible to a 2-dim torch.Tensor, but got "
+                                f"{len(raw_data.shape)}-dim " if hasattr(raw_data, 'shape') else ""
+                                f"raw_data={raw_data}") from exp
         self.raw_data = ReadOnlyTensorView(raw_data)
         # [Optional] start_datetime 对于某些简单的任务不是必需的
-        if not isinstance(start_datetime, (datetime, type(None))): # TODO Simplify type check
+        if start_datetime is not None and not isinstance(start_datetime, datetime): 
             raise TypeError(f"start_datetime should be an instance of datetime.datetime, but got start_datetime={type(start_datetime)} {start_datetime}")
         self.start_dt = start_datetime
 
 import copy
-# TODO 重写__getattr__方法将segdata子对象的成员暴露给Dataset对象
+import warnings
+
 class RegressionSeg(Dataset):
     r"""Map-Style subclass of torch.utils.data.Dataset for Remaining Time Estimation.
     
@@ -63,39 +66,70 @@ class RegressionSeg(Dataset):
         init_y(float): Value of the label at the very beginning of this seg.
     """
     segdata: TimeSeriesSeg
-    window_size: int
+    _window_size: int # TODO 厘清 @property 在 type annotations
     task_type: Goal = Goal.REGRESSION
-    X: ReadOnlyTensorView # TODO Constrained to 2-dim Tensor
-    y: Tensor # TODO Constrained with typeof X
+    X: ReadOnlyTensorView
+    y_all: ReadOnlyTensorView
+    y: Optional[ReadOnlyTensorView]
     _L: int 
-    def __init__(self, X, init_y, window_size, sample_rate, start_datetime=None, *args, **kwargs):
+
+    def __init__(self, X: ReadOnlyTensorView, init_y: float, window_size: int, sample_rate:int, start_datetime: Optional[datetime]=None, *args, **kwargs) -> None:
         self.segdata = TimeSeriesSeg(sample_rate, X, start_datetime)
 
-        if not isinstance(window_size, int) or window_size <= 0:
-            raise ValueError(f"window_size should be a positive integer value, but got window_size={window_size}")
-        self.window_size = window_size
+        self.X = self.segdata.raw_data
+        
+        if not isinstance(init_y, float):
+            try:
+                init_y = float(init_y)
+            except:
+                raise TypeError(f"init_y should be convertible to float, but got {type(init_y)} init_y={init_y}")
+        if init_y <= 0:
+            warnings.warn(f"init_y should has a positive value, but got init_y={init_y}")            
+        
+        y_all = init_y - (torch.arange(start=0, end=self.X.shape[1], dtype=torch.double) / sample_rate)
+        self.y_all = ReadOnlyTensorView(y_all)
 
-        self.X = self.segdata.raw_data; self._update_L()
+        self.window_size = window_size # Would call self._update_label() internally to update self._L & self.y  
 
-        # Use the right-end side sampling vector's label as the whole window's label
-        self.y = init_y - (torch.arange(start=window_size-1, end=self.X.shape[1]-1, dtype=torch.double) / sample_rate) if self._L > 0 else None 
-        # self.y = ReadOnlyTensorView(self.y) # Use @ReadOnlyTensorView
         super().__init__(*args, **kwargs)
-    def __len__(self):
+
+    @property
+    def window_size(self):
+        return self._window_size
+    @window_size.setter
+    def window_size(self, val):
+        if not isinstance(val, int) or val <= 0:
+            raise ValueError(f"window_size should be a positive integer value, but got window_size={val}")
+        if val > self.X.shape[1]:
+            warnings.warn(f"window_size should be smaller than data length, got window_size={val}, data length={self.X.shape[1]}")
+        self._window_size = val
+        self._update_label()
+    
+    def __len__(self) -> int:
         return self._L if self._L > 0 else 0
     
-    def __getitem__(self, index): # 由调用方保证不越界
+    def __getattribute__(self, __name: str):
+        if __name in ('raw_data', 'start_dt', 'sample_rate'):
+            return self.segdata.__getattribute__(__name)
+        return super().__getattribute__(__name)
+    
+    def __getitem__(self, index: int) -> Tuple[ReadOnlyTensorView, ReadOnlyTensorView]: # 由调用方保证不越界
         return self.X[:, index:(index+self.window_size)], self.y[index]
     
-    def _update_L(self):
-        self._L = self.X.shape[1] - self.window_size + 1
+    # def __getitems__(self, indices: Sequence[int]) -> Tuple[ReadOnlyTensorView, ReadOnlyTensorView]: # 由调用方保证不越界
+    #     raise NotImplementedError
     
-    def range_clone(self, start:Optional[int] = 0, end: Optional[int] = None): # 由调用方保证参数类型以及start < end
+    def _update_label(self) -> None:
+        self._L = self.X.shape[1] - self.window_size + 1
+        # Use the window's right-end side label as the whole window's label
+        self.y = self.y_all[self.window_size-1:] if self._L > 0 else None
+    
+    def range_clone(self, start:Optional[int] = 0, end: Optional[int] = None) -> 'RegressionSeg': # 由调用方保证参数类型以及 start < end
         new_dst = copy.copy(self)
         new_dst.X = new_dst.segdata.raw_data[:, start:end]
-        new_dst._update_L()
-        new_dst.y = new_dst.y[start:(end-self.window_size) if isinstance(end, int) else None] \
-                    if new_dst._L > 0 else None
+        new_dst.y_all = new_dst.y_all[start:end]
+        new_dst._update_label()
+
         return new_dst
 
 class ClassificationSeg(Dataset):
@@ -106,33 +140,58 @@ class ClassificationSeg(Dataset):
         window_size(int)
         y(int): Value of the seg label.    
     """    
-    window_size: int
+    segdata: TimeSeriesSeg
+    _window_size: int # TODO 厘清 @property 在 type annotations
     task_type: Goal = Goal.CLASSIFICATION
-    X: ReadOnlyTensorView # TODO Constrained to 2-dim Tensor
-    y: int
+    X: ReadOnlyTensorView
+    y: Optional[int]
     _L: int 
-    def __init__(self, X, y, window_size, sample_rate, start_datetime=None, *args, **kwargs):
+    def __init__(self, X: ReadOnlyTensorView, y: int, window_size: int, sample_rate: int, start_datetime: Optional[datetime]=None, *args, **kwargs) -> None:
         self.segdata = TimeSeriesSeg(sample_rate, X, start_datetime)
 
-        if not isinstance(window_size, int) or window_size <= 0:
-            raise ValueError(f"window_size should be a positive integer value, but got window_size={window_size}")
-        self.window_size = window_size
+        self.X = self.segdata.raw_data
 
-        self.X = self.segdata.raw_data; self._update_L(); self.y = y
+        self.window_size = window_size # Would call self._update_label() internally to update self._L
+
+        if not isinstance(y, int):
+            warnings.warn(f"Param 'y' expected type int, but got type {type(y)}")
+        self.y = y if self._L > 0 else None     
+
         super().__init__(*args, **kwargs)
-    def __len__(self):
+
+    @property
+    def window_size(self):
+        return self._window_size
+    @window_size.setter
+    def window_size(self, val):
+        if not isinstance(val, int) or val <= 0:
+            raise ValueError(f"window_size should be a positive integer value, but got window_size={val}")
+        if val > self.X.shape[1]:
+            warnings.warn(f"window_size should be smaller than data length, got window_size={val}, data length={self.X.shape[1]}")
+        self._window_size = val
+        self._update_label()
+            
+    def __len__(self) -> int:
         return self._L if self._L > 0 else 0
     
-    def __getitem__(self, index): # 由调用方保证不越界
-        return self.X[:, index:(index+self.window_size)], self.y
+    def __getattribute__(self, __name: str):
+        if __name in ('raw_data', 'start_dt', 'sample_rate'):
+            return self.segdata.__getattribute__(__name)
+        return super().__getattribute__(__name)    
     
-    def _update_L(self):
+    def __getitem__(self, index: int) -> Tuple[ReadOnlyTensorView, int]: # 由调用方保证不越界
+        return self.X[:, index:(index+self.window_size)], self.y
+
+    # def __getitems__(self, indices: Sequence[int]) -> Tuple[ReadOnlyTensorView, ReadOnlyTensorView]: # 由调用方保证不越界
+    #     raise NotImplementedError    
+    
+    def _update_label(self) -> None:
         self._L = self.X.shape[1] - self.window_size + 1
 
     def range_clone(self, start:Optional[int] = 0, end: Optional[int] = None): # 由调用方保证参数类型以及start < end
         new_dst = copy.copy(self)
         new_dst.X = new_dst.segdata.raw_data[:, start:end]
-        new_dst._update_L()
+        new_dst._update_label()
         new_dst.y = new_dst.y if new_dst._L > 0 else None 
         return new_dst
 
@@ -148,8 +207,8 @@ class SplicedDataset(ConcatDataset):
     task_type: Goal
     # X_lst: List[TensorView] 
     # y_lst: List[Tenso|int]
-    def __init__(self, datasets: Sequence[Dataset]): 
-        def all_equal(iterable):
+    def __init__(self, datasets: Sequence[Dataset]) -> None: 
+        def all_equal(iterable: Iterable[EEGSeg]):
             lst = list(iterable)
             return all(x == lst[0] for x in lst[1:])
         # datasets = list(datasets)
@@ -161,16 +220,38 @@ class SplicedDataset(ConcatDataset):
             if not all_equal(map(lambda d: d.window_size, datasets)): # TODO d: Union[ClassificationSeg, RegressionSeg]
                 raise ValueError("Inconsistent 'window_size' attributes of all datasets.") 
             if not all_equal(map(lambda d: d.task_type, datasets)): # TODO d: Union[ClassificationSeg, RegressionSeg]
-                raise ValueError("Inconsistent 'task_type' attributes of all datasets.")                              
+                raise ValueError("Inconsistent 'task_type' attributes of all datasets.")   
+            # TODO 用标准库组件替代 lambda 函数作 AttrGetter                           
         self.window_size = datasets[0].window_size
         self.sample_rate = datasets[0].segdata.sample_rate
         self.task_type = datasets[0].task_type
-        # self.X_lst = list[map(lambda d: d.X.as_readonly_view(), datasets)]
-        # self.y_lst = [d.y for d in datasets]
+
         super().__init__(datasets)
 
+    # @property
+    # def window_size(self) -> int:
+    #     return self._window_size
+    # @window_size.setter
+    # def window_size(self, val: int) -> None:
+    #     if not isinstance(val, int) or val <= 0:
+    #         raise ValueError(f"window_size should be a positive integer value, but got window_size={val}") 
+    #     # TODO 将下面的更改写成事务性可回滚的
+    #     for seg in self.datasets:
+    #         seg.window_size = val # 这样设计不好，因为.datasets元素皆有可能被多个split生成的实例共享，修改其window_size属性会影响别的实例，而别的实例又无法重新初始化
+    #     self._window_size = val
+    
+    def rewsz(self, newsz: int) -> 'SplicedDataset':
+        if not isinstance(newsz, int) or newsz <= 0:
+            raise ValueError(f"window_size should be a positive integer value, but got window_size={newsz}")         
+        newlst = [copy.copy(d) for d in self.datasets]
+        for d in newlst: d.window_size = newsz
+        return SplicedDataset(newlst)
+
     # TODO 慎重考虑下面三个split涉及的深浅拷贝问题
-    def split_by_seg(self, seg_mask): # seg_mask: str 其中r表示训练，v表示验证，t表示测试， 其余字符表示忽略不用
+    def split_by_seg(self, seg_mask: str) -> Tuple['SplicedDataset', 'SplicedDataset', 'SplicedDataset']: # seg_mask: str 其中r表示训练，v表示验证，t表示测试， 其余字符表示忽略不用
+        r"""
+        
+        """
         # 将一个dataset列表依据字符串表示的掩码划分成三个ConcatDataset并返回
         # 第三方库应该也有类似的实现吧，猜测
         assert(len(self.datasets) == len(seg_mask))
@@ -187,10 +268,13 @@ class SplicedDataset(ConcatDataset):
     
     # 参数含义见 create_label_tgt_classification.py 中的 'Label' 字段
     # TODO 这个编码规则效率和简洁性还行，不过还是不太优雅
-    def split_by_event(self, label_lst, event_mask, include_trailing_seg): # mask含义同split_by_seg， include_trailing_seg表示最后一次发作之后的尾随间期
+    def split_by_event(self, label_lst: List[str], event_mask: Dict[int, str], include_trailing_seg: str) -> Tuple['SplicedDataset', 'SplicedDataset', 'SplicedDataset']: # mask含义同split_by_seg， include_trailing_seg表示最后一次发作之后的尾随间期
+        r"""
+        
+        """
         assert(len(self.datasets) == len(label_lst))
         # TODO assert(r_right < v_left && v_right < t_left)
-        seg_mask = []
+        seg_mask: List[str] = []
         regex = r'[a-zA-Z]+([0-9+]+)-.+' # 这个与生成的seg label约定有关
         for label in label_lst: # for ds, label in zip(self, label_lst):
             match = re.search(regex, label)
@@ -198,8 +282,11 @@ class SplicedDataset(ConcatDataset):
             seg_mask.append(include_trailing_seg if s == '+' else event_mask[int(s)-1])
         return self.split_by_seg(seg_mask)
     
-
-    def split_by_proportion(self, train_ratio=0.7, valid_ratio=0.1, *args, **kwargs): # 这个东西第三方库更好
+    # TODO 为这个方法编写更充分的测试
+    def split_by_proportion(self, train_ratio: float=0.7, valid_ratio: float=0.1, *args, **kwargs) -> Tuple['SplicedDataset', 'SplicedDataset', 'SplicedDataset']: # 这个东西第三方库更好
+        r"""
+        
+        """
         # 将一个ConcatDataset按比率分割，返回三个Subset
         total_points = sum(d.X.shape[1] for d in self.datasets)
         train_samples = round(train_ratio * total_points)
@@ -238,6 +325,9 @@ class SplicedDataset(ConcatDataset):
         
         return SplicedDataset(train_dsts), SplicedDataset(valid_dsts), SplicedDataset(test_dsts)
 
+# TODO 优雅解决类型标注中返回自身类型的情况   
+SplitSpliced = Optional[SplicedDataset]
+
 #-------------------------- Auxiliary Function ----------------------------#
 # These functions are used to quickly create SplicedDataset class instances 
 # by combining JSON generated from ../create_label_tgt_classification.py
@@ -250,8 +340,11 @@ import os, json
 import numpy as np
 
 # TODO 修改../create_label_tgt_classification.py 以支持 start_datetime 方便后期可视化
-def get_classification_datasets(data_dir, json_path, window_size, sample_rate, \
-                                label = classification_label) -> Tuple[SplicedDataset, List[str]]:
+def get_classification_datasets(data_dir: str, json_path: str, window_size: int, sample_rate: int, \
+                                label: IntEnum = classification_label) -> Tuple[List[EEGSeg], List[str]]:
+    r'''
+    
+    '''
     with open(json_path) as f:
         seg_lst = json.load(f)    
     ds_lst = []; label_lst = []
@@ -268,10 +361,16 @@ def get_classification_datasets(data_dir, json_path, window_size, sample_rate, \
         else: 
             raise ValueError from seg["Label"]
         label_lst.append(seg["Label"])
-    return SplicedDataset(ds_lst), label_lst
+    
+    # return SplicedDataset(ds_lst), label_lst
+    return ds_lst, label_lst
 
-def get_regression_datasets(data_dir, json_path, window_size, sample_rate) \
-                                -> Tuple[SplicedDataset, List[str]]:
+# TODO 修改../create_label_tgt_classification.py 以支持未知下次发作的Inter区段和 start_datetime
+def get_regression_datasets(data_dir: str, json_path: str, window_size: int, sample_rate: int) \
+                                -> Tuple[List[EEGSeg], List[str]]:
+    r'''
+    
+    '''
     with open(json_path) as f:
         seg_lst = json.load(f)
 
@@ -288,78 +387,23 @@ def get_regression_datasets(data_dir, json_path, window_size, sample_rate) \
             npy_path = os.path.join(data_dir, seg["File"])
             X = np.load(npy_path).squeeze()
             X = X[:, slice(*seg["Span"])]
-            y0 = seg["PreSec"]; # 未知下次发作的Inter区段 y0 设置成负值
-            if y0 > 0: # TODO y0 < 0 含义暂时构想为保证实际 init_y >= abs(y0)
-                ds_lst.append(RegressionSeg(X, y0, window_size, sample_rate))
+            y0 = seg["PreSec"]; # 未知后续是否有发作的Inter区段 y0 设置成 str 而不是简单的 float 可能的一个值为 '7200.0+'
+            if isinstance(y0, str) and y0.endswith('+'):
+                y0 = float(y0[:-1])
+            ds_lst.append(RegressionSeg(X, y0, window_size, sample_rate))
             label_lst.append(seg["Label"])
-        else: # TODO 暂时没想好估计发作期区间的标签怎么定义
-            pass # raise ValueError from seg["Label"]
+        else: 
+            warnings.warn('The JSON file for a regression task should consist of a list of "seg" elements. In each "seg" element, '
+                          'the "Label" field can startwith either "Pre" or "Inter" as valid substrings to indicate potential value. '
+                          'Any other category substring should not be present.')
+            # raise ValueError from seg["Label"]
         
-    return SplicedDataset(ds_lst), label_lst
+    # return SplicedDataset(ds_lst), label_lst
+    return ds_lst, label_lst
 
 #-------------------------- CustomSampler ----------------------------#
-from torch.utils.data import RandomSampler, Sampler
 
-r''' ![Deprecated] Deprecate because of our large dataset size(about 2^32) and torch.multinomial()'s limited input size
-class AugmentRandomSampler(Sampler[int]):
-    r"""Samples elements randomly from SplicedDataset instance using specified category-weights. 
-
-    Args:
-        data_source (SplicedDataset): dataset to sample from
-        weights (sequence)   : a sequence of weights, not necessary summing up to one
-        num_samples (int): number of samples to draw, default=`len(dataset)`.
-        generator (Generator): Generator used in sampling.
-    """
-    data_source: SplicedDataset
-    weights: Tensor
-    num_samples: int
-
-    def __init__(self, data_source: SplicedDataset, weights: Dict[int, float],
-                 num_samples: int, generator=None) -> None:
-        if not isinstance(data_source, SplicedDataset) or data_source.task_type != Goal.CLASSIFICATION:
-            raise ValueError("data_source should be an instance of class SplicedDataset within task_type set to Goal.CLASSIFICATION, "
-                             f"but got data_source={data_source}")
-        self.data_source = data_source 
-
-        self.generator = generator
-
-        if not isinstance(weights, dict):
-            raise TypeError("weights should be a dict mapping integral category to float weight value, "
-                             f"but got weights:{type(weights)} ={weights}")
-        for dst in self.data_source.datasets:
-            if dst.y in weights:
-                if not isinstance(weights[dst.y], (int, float)):
-                    try: weights[dst.y] = float(weights[dst.y])
-                    except: raise ValueError(f"Could not convert value to float type in pair key={dst.y}, value={weights[dst.y]}")
-                    if weights[dst.y] <= 0:
-                        raise ValueError(f"weights value must be positive, got pair key={dst.y}, value={weights[dst.y]}")
-            else: 
-                raise KeyError(f"Could not find key={dst.y} in weights.")
-        self.weights = weights
-
-        if not isinstance(num_samples, int) or num_samples <= 0:
-            raise ValueError(f"num_samples should be a positive integer value, but got num_samples={num_samples}")
-        assert(num_samples <= len(data_source)) # TODO 暂时不支持这种情况，除非已知 torch.multinomial 支持
-        self.num_samples = num_samples
-   
-    # TODO RuntimeError: number of categories cannot exceed 2^24
-    def __iter__(self) -> Iterator[int]:
-        sz_counter = defaultdict(int)
-        for dst in self.data_source.datasets:
-            sz_counter[dst.y] += len(dst)
-        
-        final_weights = [torch.empty(size=(len(dst),), dtype=torch.double).fill_(self.weights[dst.y] / sz_counter[dst.y]) 
-                         for dst in self.data_source.datasets]
-        final_weights = torch.concat(final_weights)
-        rand_tensor = torch.multinomial(final_weights, self.num_samples, False, # Use False instead of removed member self.replacement, 
-                                        generator=self.generator)
-        yield from iter(rand_tensor.tolist())   
-
-
-    def __len__(self) -> int:
-        return self.num_samples
-'''
-        
+r''' ![Deprecated] Due to the inefficiency of index generation and dereference when applied on ConcatDataset, this class has been deprecated
 ### 写成这种Sampler未必最优，因为每个返回的int还要再调用一次ConcatDataset的__getitem__，这是对数复杂度而非常量
 ### TODO 有空可以考虑直接写成一个带参迭代器得了，替代torch.utils.DataLoader这一层抽象！参考 DataLoader 源代码
 class AugmentSequentialSampler(Sampler[int]):
@@ -407,50 +451,50 @@ class AugmentSequentialSampler(Sampler[int]):
 
     # Within step_size feature enabled, it's impossible to calculate __len__(self)
     # def __len__(self) -> int: 
+'''
 
 from collections import defaultdict
-# TODO 阅读 DataLoader & RandomSampler & generator 源代码实现正确的继承关系以及多进程支持和类型标注
-class AugmentRandomDataLoader:
+from torch.utils.data import DataLoader
+
+class AugmentRandomDataLoader(DataLoader):
     r"""
     
     """
-    def __init__(self, ds_lst: Iterable[ClassificationSeg], weights: Dict[int, float], batch_size: int = 64,
-                 generator=None, *args, **kwargs) -> None:
+    class CatalogDataset(Dataset):
+        def __init__(self, y_2_dst: Dict[int, ConcatDataset]) -> None:          
+            super().__init__()
+            concat_lst = list(y_2_dst.values())
+            
+            def infinite_random_generator(cdst: ConcatDataset):
+                while True:
+                    # 下面这句不知道为什么会卡死，看来迭代器和流式写法还是没学会
+                    # yield from map(lambda k: cdst[k], torch.randperm(len(cdst), generator=self.generator))
+                    for k in torch.randperm(len(cdst), generator=self.generator).tolist(): # 类内不放回抽样 replacement=False
+                        yield cdst[k]  
+            self.gen_lst = [infinite_random_generator(d) for d in concat_lst]
+
+        def __getitem__(self, index: int) -> Tuple[ReadOnlyTensorView, int]: # TODO TA
+            return next(self.gen_lst[index])
+        # def __getitems__(self, indices: List[int]):
+        #     pass
+    
+    # class WrappedInfWeightedSampler:
+    #     raise NotImplementedError
+    # TODO 支持无限长度 sampler wrapper 以及转发 generator 参数并区别开 Sampler & DataLoader 使用的生成器
+    def __init__(self, ds_lst: Iterable[ClassificationSeg], ratio_dict: Dict[int, float], num_sample: int, *args, **kwargs) -> None:
         ds_lst = list(ds_lst)
         if not all(isinstance(ds, ClassificationSeg) for ds in ds_lst):
             raise TypeError(f"All elems in ds_lst arg should be an object of type ClassificationSeg")
-        y_2_dst: Dict[int, ConcatDataset] = self.categorize_and_concat(ds_lst)
         
-        # torch.tensor() will do input check by the way
-        self.weights_tensor = torch.tensor([weights[k] for k in y_2_dst.keys()], dtype=torch.double)        
-        self.concat_lst = list(y_2_dst.values())
-
-        if not isinstance(batch_size, int) or batch_size <= 0:
-            raise ValueError(f"batch_size should be a positive integer value, but got batch_size={batch_size}")      
-        self.batch_size = batch_size
-
-        # TODO 加入 generator 支持
-        self.generator = generator
-        # TODO 挑选 DataLoader Hierarchy 中的合适类作基类      
-        # super().__init__(*args, **kwargs)
-
-    def __iter__(self):
-        def infinite_random_generator(cdst: ConcatDataset):
-            while True:
-                # 下面这句不知道为什么会卡死，看来迭代器和流式写法还是没学会
-                # yield from map(lambda k: cdst[k], torch.randperm(len(cdst), generator=self.generator))
-                for k in torch.randperm(len(cdst), generator=self.generator).tolist():
-                    yield cdst[k]
-        gen_lst = [infinite_random_generator(d) for d in self.concat_lst]
+        y_2_dst = AugmentRandomDataLoader.categorize_and_concat(ds_lst)
+        inner_dst = AugmentRandomDataLoader.CatalogDataset(y_2_dst)
+        weights_tensor = torch.tensor([ratio_dict[k] for k in y_2_dst.keys()], dtype=torch.double) # torch.tensor() will do input check by the way
         # 类别间放回抽样replacement=True，类内不放回抽样 replacement=False
-        while True: # TODO 支持 num_samples & drop_last
-            catg_lst = torch.multinomial(self.weights_tensor, self.batch_size, replacement=True,  
-                                     generator=self.generator).tolist()
-            gather_xy = [next(gen_lst[k]) for k in catg_lst]
-            yield torch.stack([xy[0] for xy in gather_xy]), torch.tensor([xy[1] for xy in gather_xy]) # List[IntEnum] 不能用作 torch.stack 参数所以使用 torch.tensor
+        weighted_sampler = torch.utils.data.WeightedRandomSampler(weights_tensor, num_sample, replacement=True)
+        super().__init__(inner_dst, *args, sampler=weighted_sampler, **kwargs)
     
     @staticmethod
-    def categorize_and_concat(ds_lst: Iterable[ClassificationSeg]):
+    def categorize_and_concat(ds_lst: Iterable[ClassificationSeg]) -> Dict[int, ConcatDataset]:
         y_2_dst = defaultdict(list)
         for dst in ds_lst:
             y_2_dst[dst.y].append(dst) # categorize
@@ -458,5 +502,17 @@ class AugmentRandomDataLoader:
             y_2_dst[k] = ConcatDataset(y_2_dst[k]) # Concat
         return y_2_dst
 
-# TODO Impl
-# class AugmentSequentialDataLoader: 
+# TODO 多进程 SequentialDataLoader 建议先学习 NLP 和 Audio TS 的最佳实践再设计
+def SequentialGenerator(data_source: Iterable[EEGSeg], random_offset: bool = True): # TODO TA
+    r'''
+
+    '''
+    for idxable in data_source:       
+        # No type check for idxable for simplicity
+        idx = int(torch.randint(high=idxable.window_size, size=(1,)).item()) if random_offset else 0
+        while idx < len(idxable):
+            stride = (yield idxable[idx]) # Use the value sent through generator.send(v) as stride
+            if not stride: idx += idxable.window_size
+            else:          idx += stride
+
+
