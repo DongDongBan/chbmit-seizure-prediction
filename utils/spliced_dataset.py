@@ -488,7 +488,7 @@ class AugmentRandomDataLoader(DataLoader):
         
         y_2_dst = AugmentRandomDataLoader.categorize_and_concat(ds_lst)
         inner_dst = AugmentRandomDataLoader.CatalogDataset(y_2_dst)
-        weights_tensor = torch.tensor([ratio_dict[k] for k in y_2_dst.keys()], dtype=torch.double) # torch.tensor() will do input check by the way
+        weights_tensor = torch.tensor([ratio_dict[k] for k in y_2_dst.keys()], dtype=torch.double) # torch.tensor() will do ratio_dict input check internally
         # 类别间放回抽样replacement=True，类内不放回抽样 replacement=False
         weighted_sampler = torch.utils.data.WeightedRandomSampler(weights_tensor, num_sample, replacement=True)
         super().__init__(inner_dst, *args, sampler=weighted_sampler, **kwargs)
