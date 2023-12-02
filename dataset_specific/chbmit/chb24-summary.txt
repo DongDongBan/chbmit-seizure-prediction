@@ -1,0 +1,127 @@
+Data Sampling Rate: 256 Hz
+*************************
+
+Channels in EDF Files:
+**********************
+Channel 1: FP1-F7
+Channel 2: F7-T7
+Channel 3: T7-P7
+Channel 4: P7-O1
+Channel 5: FP1-F3
+Channel 6: F3-C3
+Channel 7: C3-P3
+Channel 8: P3-O1
+Channel 9: FP2-F4
+Channel 10: F4-C4
+Channel 11: C4-P4
+Channel 12: P4-O2
+Channel 13: FP2-F8
+Channel 14: F8-T8
+Channel 15: T8-P8
+Channel 16: P8-O2
+Channel 17: FZ-CZ
+Channel 18: CZ-PZ
+Channel 19: P7-T7
+Channel 20: T7-FT9
+Channel 21: FT9-FT10
+Channel 22: FT10-T8
+Channel 23: T8-P8
+
+File Name: chb24_01.edf
+Number of Seizures in File: 2
+Seizure Start Time: 480 seconds
+Seizure End Time: 505 seconds
+Seizure Start Time: 2451 seconds
+Seizure End Time: 2476 seconds
+
+File Name: chb24_02.edf
+Number of Seizures in File: 0
+
+File Name: chb24_03.edf
+Number of Seizures in File: 2
+Seizure Start Time: 231 seconds
+Seizure End Time: 260 seconds
+Seizure Start Time: 2883 seconds
+Seizure End Time: 2908 seconds
+
+File Name: chb24_04.edf
+Number of Seizures in File: 3
+Seizure Start Time: 1088 seconds
+Seizure End Time: 1120 seconds
+Seizure Start Time: 1411 seconds
+Seizure End Time: 1438 seconds
+Seizure Start Time: 1745 seconds
+Seizure End Time: 1764 seconds
+
+File Name: chb24_05.edf
+Number of Seizures in File: 0
+
+File Name: chb24_06.edf
+Number of Seizures in File: 1
+Seizure Start Time: 1229 seconds
+Seizure End Time: 1253 seconds
+
+File Name: chb24_07.edf
+Number of Seizures in File: 1
+Seizure Start Time: 38 seconds
+Seizure End Time: 60 seconds
+
+File Name: chb24_08.edf
+Number of Seizures in File: 0
+
+File Name: chb24_09.edf
+Number of Seizures in File: 1
+Seizure Start Time: 1745 seconds
+Seizure End Time: 1764 seconds
+
+File Name: chb24_10.edf
+Number of Seizures in File: 0
+
+File Name: chb24_11.edf
+Number of Seizures in File: 1
+Seizure Start Time: 3527 seconds
+Seizure End Time: 3597 seconds
+
+File Name: chb24_12.edf
+Number of Seizures in File: 0
+
+File Name: chb24_13.edf
+Number of Seizures in File: 1
+Seizure Start Time: 3288 seconds
+Seizure End Time: 3304 seconds
+
+File Name: chb24_14.edf
+Number of Seizures in File: 1
+Seizure Start Time: 1939 seconds
+Seizure End Time: 1966 seconds
+
+File Name: chb24_15.edf
+Number of Seizures in File: 1
+Seizure Start Time: 3552 seconds
+Seizure End Time: 3569 seconds
+
+File Name: chb24_16.edf
+Number of Seizures in File: 0
+
+File Name: chb24_17.edf
+Number of Seizures in File: 1
+Seizure Start Time: 3515 seconds
+Seizure End Time: 3581 seconds
+
+File Name: chb24_18.edf
+Number of Seizures in File: 0
+
+File Name: chb24_19.edf
+Number of Seizures in File: 0
+
+File Name: chb24_20.edf
+Number of Seizures in File: 0
+
+File Name: chb24_21.edf
+Number of Seizures in File: 1
+Seizure Start Time: 2804 seconds
+Seizure End Time: 2872 seconds
+
+File Name: chb24_22.edf
+Number of Seizures in File: 0
+
